@@ -33,14 +33,17 @@ O(\mathcal{J}) \\
 
 $$
 \begin{aligned}
-\begin{bmatrix} \mathbf{O}(\mathcal{J} \cup \mathcal{J}) \\ \text{LSE}(\mathcal{J} \cup \mathcal{J}) \end{bmatrix} 
+\begin{bmatrix} \mathbf{O}(\mathcal{J} \cup \mathcal{T}) \\ \text{LSE}(\mathcal{J} \cup \mathcal{T}) \end{bmatrix} 
 &= \begin{bmatrix} \mathbf{O}(\mathcal{J}) \\ \text{LSE}(\mathcal{J}) \end{bmatrix} 
 \oplus 
-\begin{bmatrix} \mathbf{O}(\mathcal{J}) \\ \text{LSE}(\mathcal{J}) \end{bmatrix} \\[6pt]
+\begin{bmatrix} \mathbf{O}(\mathcal{T}) \\ \text{LSE}(\mathcal{T}) \end{bmatrix} \\
 &= \begin{bmatrix} 
-\displaystyle\frac{\exp(\text{LSE}(\mathcal{J}))\mathbf{O}(\mathcal{J}) + \exp(\text{LSE}(\mathcal{J}))\mathbf{O}(\mathcal{J})}{\exp(\text{LSE}(\mathcal{J})) + \exp(\text{LSE}(\mathcal{J}))} \\[12pt]
-\log(\exp(\text{LSE}(\mathcal{J})) + \exp(\text{LSE}(\mathcal{J})))
+\displaystyle\frac{\exp(\text{LSE}(\mathcal{J}))\mathbf{O}(\mathcal{J}) + \exp(\text{LSE}(\mathcal{T}))\mathbf{O}(\mathcal{T})}{\exp(\text{LSE}(\mathcal{J})) + \exp(\text{LSE}(\mathcal{T}))} \\
+\log(\exp(\text{LSE}(\mathcal{J})) + \exp(\text{LSE}(\mathcal{T})))
 \end{bmatrix}
 \end{aligned}
 $$
 
+## benchmark测试
+### triton
+首先可以先测试一下
