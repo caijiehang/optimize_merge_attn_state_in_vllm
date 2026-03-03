@@ -27,11 +27,13 @@ $$\mathbf{O}(\mathcal{J}) = \sum_{i \in \mathcal{J}} \frac{\exp(\mathbf{q} \cdot
 $$\mathbf{O}(\mathcal{T}) = \sum_{j \in \mathcal{T}} \frac{\exp(\mathbf{q} \cdot \mathbf{k}_j)}{\exp(\mathbf{LSE}(\mathcal{T}))} \cdot \mathbf{v}_i$$
 
 论文里将注意力状态定义注意力输出和注意力尺度的元组：
-$\begin{bmatrix}
+$
+\begin{bmatrix}
 O(\mathcal{J}) \\ 
 \text{LSE}(\mathcal{J})
-\end{bmatrix}$
-那么对于 $\mathcal{T} \cup \mathcal{J}$ 的注意力状态就可以通过引入算子$\oplus$进行计算：
+\end{bmatrix}
+$
+那么对于 $\mathcal{T} \cup \mathcal{J}$ 的注意力状态就可以通过引入算子 $\oplus$ 进行计算：
 
 $$
 \begin{aligned}
@@ -56,8 +58,7 @@ $$
 \end{aligned}
 $$
 
-## benchmark测试
-### pytorch
+## pytorch实现
 
 首先我们可以看一下`triton`实现过程中，所需要输入的数据
 ```python
@@ -125,3 +126,97 @@ def merge_attn_states(
 原因在`triton`源码中有一段话：“`Flash Attention2`和`Flash Attention3`中，面对`token length=0`的情况有不同的返回值，分别为`inf`和`-inf`。”
 
 对于`merge attention state`来说，后续要进行指数运算，如果返回的是`-inf`，那么 $\exp(-\inf) = 0$ ，表示这个`token length = 0` 的切块对`attention`的贡献为0，这是正确的，但是如果是`inf`,则 $\exp(\inf) = \inf$ ，这就将导致数值溢出，计算结果错误，所以在这里加了一层过滤，对`Flash Attention2`的错误进行纠正
+
+## triton基础算子
+triton的实现主要包括以下的几个部分：
+- 加载数据并inf处理
+    ```python
+    token_idx = tl.program_id(0)                                        #   当前线程计算token的索引
+    num_tokens = tl.num_programs(0)                                     #   token的总数
+    head_idx = tl.program_id(1)                                         #   当前线程计算head的索引
+    num_heads = tl.num_programs(1)                                      #   当前head的总数
+
+    p_lse = tl.load(prefix_lse + head_idx * num_tokens + token_idx)     #   取出当前计算token的前缀lse
+    s_lse = tl.load(suffix_lse + head_idx * num_tokens + token_idx)     #   取出当前计算token的后缀lse
+
+    # FA2 and FA3 have different behavior for when the sum-exp is 0, this namely
+    # arises with 0 len seqlens. FA3 returns -inf here while FA2 returns inf.
+    # If we see an inf assume FA2 and convert inf to -inf for consistency
+    # and correctness. Inf generally doesn't make sense in this context outside
+    # of undefined-behavior/FA2-case, so I think this a safe assumption.
+    p_lse = float("-inf") if p_lse == float("inf") else p_lse           #   纠错fa2并防止数值溢出
+    s_lse = float("-inf") if s_lse == float("inf") else s_lse           #   纠错fa2并防止数值溢出
+    ```
+
+- 数据归一化计算
+    ```python
+    max_lse = tl.maximum(p_lse, s_lse)  #   取最大lse
+    p_lse = p_lse - max_lse             #   进行归一化，防止数值计算溢出
+    s_lse = s_lse - max_lse             #   进行归一化，防止数值计算溢出
+    # Will reuse precomputed Exp values for scale factor computation.
+    p_se = tl.exp(p_lse)                #   
+    s_se = tl.exp(s_lse)                
+    out_se = p_se + s_se                #   计算输出sum-exp
+    ```
+
+- 最后计算输出：计算`prefix_output`和`suffix_output`各自的`scale`值，然后求两者的加权和作为最后的输出
+    ```python
+    head_arange = tl.arange(0, PADDED_HEAD_SIZE)
+    head_mask = head_arange < HEAD_SIZE
+    p_out = tl.load(
+        prefix_output
+        + token_idx * num_heads * prefix_head_stride
+        + head_idx * prefix_head_stride
+        + head_arange,
+        mask=head_mask,
+    )
+    s_out = tl.load(
+        suffix_output
+        + token_idx * num_heads * prefix_head_stride
+        + head_idx * prefix_head_stride
+        + head_arange,
+        mask=head_mask,
+    )
+
+    # NOTE(woosuk): Be careful with the numerical stability.
+    # We should compute the scale first, and then multiply it with the output.
+    # Do not multiply the output with tl.exp(p_lse) or tl.exp(s_lse) directly.
+    p_scale = p_se / out_se
+    s_scale = s_se / out_se
+    out = p_out * p_scale + s_out * s_scale
+    tl.store(
+        output
+        + token_idx * num_heads * output_head_stride
+        + head_idx * output_head_stride
+        + head_arange,
+        out,
+        mask=head_mask,
+    )
+    ```
+
+
+`vllm`给这个算子分配了`(num_tokens,num_query_heads)`个`threadblock`，每个`head`的`headsize`是多少，这个`threadblock`就处理多少个值
+
+```python
+# TODO(woosuk): Use CUDA kernel instead of Triton to minimize CPU overhead.
+merge_attn_states_kernel[(num_tokens, num_query_heads)](
+    output,
+    output_lse,
+    prefix_output,
+    prefix_lse,
+    suffix_output,
+    suffix_lse,
+    prefix_head_stride,
+    output_head_stride,
+    head_size,
+    padded_head_size,
+    output_lse is not None,
+)
+```
+
+## Triton算子分析
+- 基本分析 \
+    基于上一小节，我们知道，`vllm`在调用`merge_attn_states_kernel`时，分配了`(num_tokens,num_query_heads)`个`threadblock`，每个`threadblock`处理`headsize`个数据，这就带来了一些问题：
+    1. 如果`(num_tokens,num_query_heads)`较大，而`headsize`较小，就会导致`threadblock`数过大，而每个`threadblock`处理的数据量很小，计算密度低。
+    2. 在调用`Triton kernel`的时候会带来一定的cpu开销
+
