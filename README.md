@@ -14,7 +14,7 @@ $$\mathbf{o} = \sum_{i=1}^N \frac{\exp(\mathbf{q} \cdot \mathbf{k}_i)}{\sum_{j=1
 
 $$\text{局部归一化项} = \sum_{j \in \mathcal{J}} \exp(\mathbf{q} \cdot \mathbf{k}_j)$$
 
-直接保存局部归一化项在数值上极易导致指数溢出。因此，我们引入 Log-Sum-Exp (LSE) 技巧来保证数值稳定性。我们将块 $\mathcal{J}$ 的注意力尺度（Attention Scale）定义为局部归一化项的对数：
+直接保存局部归一化项在数值上极易导致指数溢出。因此，我们引入 Log-Sum-Exp (LSE) 技巧来保证数值稳定性。我们将块 $\mathcal{J}$ 的注意力尺度（Attention scalar）定义为局部归一化项的对数：
 
 $$\mathbf{LSE}(\mathcal{J}) = \log \sum_{i \in \mathcal{J}} \exp(\mathbf{q} \cdot \mathbf{k}_i)$$
 
@@ -153,13 +153,13 @@ triton的实现主要包括以下的几个部分：
     max_lse = tl.maximum(p_lse, s_lse)  #   取最大lse
     p_lse = p_lse - max_lse             #   进行归一化，防止数值计算溢出
     s_lse = s_lse - max_lse             #   进行归一化，防止数值计算溢出
-    # Will reuse precomputed Exp values for scale factor computation.
+    # Will reuse precomputed Exp values for scalar factor computation.
     p_se = tl.exp(p_lse)                #   
     s_se = tl.exp(s_lse)                
     out_se = p_se + s_se                #   计算输出sum-exp
     ```
 
-- 最后计算输出：计算`prefix_output`和`suffix_output`各自的`scale`值，然后求两者的加权和作为最后的输出
+- 最后计算输出：计算`prefix_output`和`suffix_output`各自的`scalar`值，然后求两者的加权和作为最后的输出
     ```python
     head_arange = tl.arange(0, PADDED_HEAD_SIZE)
     head_mask = head_arange < HEAD_SIZE
@@ -179,7 +179,7 @@ triton的实现主要包括以下的几个部分：
     )
 
     # NOTE(woosuk): Be careful with the numerical stability.
-    # We should compute the scale first, and then multiply it with the output.
+    # We should compute the scalar first, and then multiply it with the output.
     # Do not multiply the output with tl.exp(p_lse) or tl.exp(s_lse) directly.
     p_scale = p_se / out_se
     s_scale = s_se / out_se
@@ -220,3 +220,175 @@ merge_attn_states_kernel[(num_tokens, num_query_heads)](
     1. 如果`(num_tokens,num_query_heads)`较大，而`headsize`较小，就会导致`threadblock`数过大，而每个`threadblock`处理的数据量很小，计算密度低。
     2. 在调用`Triton kernel`的时候会带来一定的cpu开销
 
+    那么我们可以通过`ncu`抓取`Triton`算子在执行`NUM_TOKENS = 512` `NUM_HEADS = 16` `HEAD_SIZES = 32`的执行情况
+
+    如图所示，在所有数据类型都是`float`的推理过程中，`Triton`并没有生成高效的向量化访存指令，都是
+    `ld.global.b32`，也就是每次都只访问32位的数据，
+
+    ![源码对应的profile情况](image/Source_profile.png)
+
+    并且因为这个原因，在最后执行计算`out`的时候吗，出现了`Warp stall`,查看其原因是因为`Long Scoreboard`，即`Warp`停下来等待从`Global Memory`或`Local Memory`读取的数据返回
+    ![out_warp_stall](image/out_warp_stall.png)
+
+    可以通过`register dependencies`查看是因为哪一段访存指令产生的`warp stall`,追溯到第87行指令，正好是`LDG.E`，即`load global memory`，即是因为从每个线程只从`global memory`中取一个`prefix_output`数据到寄存器中，但是这个长时间的取值过程会占用着寄存器，而其他`warp`因为寄存器处于占用状态，无法将数据从`global memory`中取到寄存器中，所以就处于`stall`的状态。
+    ![registers_dependencies](image/reg_dependencies.png)
+
+## CUDA算子优化
+最终cuda算子实现如下：
+```C++
+namespace vllm {
+    template <typename scalar_t , const uint NUM_THREADS>
+    __global__ void merge_attn_state(
+        scalar_t* output, const scalar_t* prefix_output, const float* prefix_lse, const scalar_t* suffix_output, const float* suffix_lse, scalar_t* output_lse, 
+        const uint num_tokens, const uint num_heads, const uint head_size
+    )
+    {
+        using pack_128b_t = uint4;
+        const uint pack_size = 16/sizeof(scalar_t);
+        const uint threads_per_head = head_size/pack_size;
+
+        const uint globalId = blockIdx.x * NUM_THREADS + threadIdx.x;
+        const uint tokens_heads_threads = num_tokens * num_heads * threads_per_head;
+
+        if(globalId>tokens_heads_threads) return;
+
+        const uint token_head_idx = globalId / threads_per_head;
+        const uint pack_idx = globalId % threads_per_head;
+
+        const uint token_idx = token_head_idx / num_heads;
+        const uint head_idx = token_head_idx % num_heads;
+
+        const uint pack_offest = pack_idx * pack_size;
+        const uint head_offest = token_idx * num_heads * head_size + head_idx * head_size;
+        const float* prefix_head_ptr = prefix_output + head_offest;
+        const float* suffix_head_ptr = suffix_output + head_offest;
+        scalar_t * output_head_ptr = output + head_offest;
+
+        float p_lse = prefix_lse[head_idx*num_tokens + token_idx];
+        float s_lse = suffix_lse[head_idx*num_tokens + token_idx];
+        p_lse = std::isinf(p_lse) ? -std::numeric_limits<float>::infinity() : p_lse;
+        s_lse = std::isinf(s_lse) ? -std::numeric_limits<float>::infinity() : s_lse;
+
+        float max_lse = fmax(p_lse,s_lse);
+        p_lse = p_lse-max_lse;
+        s_lse = s_lse-max_lse;
+        const float p_se = expf(p_lse);
+        const float s_se = expf(s_lse);
+        const float out_se = p_se + s_se;
+        const float p_scale = p_se/out_se;
+        const float s_scale = s_se/out_se;
+
+        if(pack_offest<head_size)
+        {
+            pack_128b_t p_out_pack = reinterpret_cast<const pack_128b_t*>(prefix_head_ptr)[pack_idx];
+            pack_128b_t s_out_pack = reinterpret_cast<const pack_128b_t*>(suffix_head_ptr)[pack_idx];
+            pack_128b_t o_output_pack;
+
+            #pragma unroll
+            for(int i = 0;i<pack_size;++i)
+            {
+                float p_out_f = vllm::to_float(reinterpret_cast<const scalar_t*>(&p_out_pack)[i]);
+                float s_out_f = vllm::to_float(reinterpret_cast<const scalar_t*>(&s_out_pack)[i]);
+                float o_out_f = p_out_f * p_scale + s_out_f * s_scale;
+                vllm::from_float(reinterpret_cast<const scalar_t*>(&o_output_pack)[i],o_out_f);
+            }
+
+            reinterpret_cast<pack_128b_t*>(output_head_ptr)[pack_idx] = o_output_pack;
+        }
+
+        if(output_lse != nullptr && pack_idx ==0)
+        {
+            float out_lse = log(out_se) + max_lse;
+            output_lse[head_idx*num_tokens + token_idx] = out_lse;
+        }
+    }
+}
+
+```
+
+这里采用`NUM THREADS = 128`作为默认线程数，根据上述分析，若采用`(num_tokens, num_heads, head_size)`布局，根据上述的讨论，在`head_size`较小时，无法有效地向量化访存，因此这里将`(num_tokens,num_heads,head_size)`扁平化处理：
+
+```C++
+const uint pack_size = 16/sizeof(scalar_t);
+const uint threads_per_head = headsize/packsize;
+const uint total_threads = num_tokens*num_heads*threads_per_head;
+
+dim3 block(NUM_THREADS);
+dim3 grid((total_threads+NUM_THREADS-1)/NUM_THREADS);
+```
+
+这里采用 `NUM_THREADS = 128` 作为默认 `Block` 大小。根据上述分析，每个线程被设计为负责一个 `128-bit` 的数据块 (pack)，其中包含 `pack_size` 个元素,其中`pack_size = 16 / sizeof(scalar_t)`。
+
+考虑到在 `LLM` 推理中，`head_size` 可能有较小的情况（例如 64 或 128）。如果采用 `(num_tokens, num_heads)` 作为二维/三维 Grid 布局，会导致每个 `Block` 内的线程数`threads_per_head`远小于一个 `Warp` 32个线程，从而造成严重的硬件资源闲置与调度碎片化。例如：如果此时 `head_size` 为 `32` , 采用 `bf16` 进行计算，则此时一个`head` 所配备的 `block`的线程数为 `threads_per_head = 32/(16/2) = 4`
+
+为此，该 Kernel 将 num_tokens、num_heads 和 threads_per_head 三个维度进行了一维线性化。并使用 `globalId` 反向计算当前处理的 `Head` 的全局索引 `token_head_idx` , 以及 `pack` 的索引 `pack_idx`。然后再根据 `Head` 的全局索引 `token_head_idx` 反向计算出 `token_idx` 和 `head_idx`。
+
+```C++
+const uint token_head_idx = globalId / threads_per_head;
+const uint pack_idx = globalId % threads_per_head;
+
+const uint token_idx = token_head_idx / num_heads;
+const uint head_idx = token_head_idx % num_heads;
+```
+
+然后根据反算得到的`token_idx`, `head_idx`, `pack_idx`计算当前处理到哪个 `token` 中的哪个 `head` 即 `head_offest` ，而当前线程处理的 `pack` 则通过 `pack_offest`进行偏移
+
+```C++
+const uint pack_offest = pack_idx * pack_size;
+const uint head_offest = token_idx * num_heads * head_size + head_idx * head_size;
+const float* prefix_head_ptr = prefix_output + head_offest;
+const float* suffix_head_ptr = suffix_output + head_offest;
+scalar_t * output_head_ptr = output + head_offest;
+```
+
+然后便是取值计算,注意：这里lse维护的数据维度为 `(num_heads,num_tokens)` , 这里为什么不跟 `output` 一样采用 `(num_tokens, num_heads)`的分布呢，原因是：在上游计算 `Attention` 时，计算任务通常是按 `Head` 分配给不同的 `Thread Block` 的，那么布局为 `(num_heads,num_tokens)`时，`Thread Block`写回属于 `head 0` 的 `num_tokens` 时，内存时连续的，可以合并访存。
+
+```C++
+float p_lse = prefix_lse[head_idx*num_tokens + token_idx];
+float s_lse = suffix_lse[head_idx*num_tokens + token_idx];
+p_lse = std::isinf(p_lse) ? -std::numeric_limits<float>::infinity() : p_lse;
+s_lse = std::isinf(s_lse) ? -std::numeric_limits<float>::infinity() : s_lse;
+
+float max_lse = fmax(p_lse,s_lse);
+p_lse = p_lse-max_lse;
+s_lse = s_lse-max_lse;
+const float p_se = expf(p_lse);
+const float s_se = expf(s_lse);
+const float out_se = p_se + s_se;
+const float p_scale = p_se/out_se;
+const float s_scale = s_se/out_se;
+```
+
+然后进行合并访存，并把数据写回out
+
+```C++
+if(pack_offest<head_size)
+{
+    pack_128b_t p_out_pack = reinterpret_cast<const pack_128b_t*>(prefix_head_ptr)[pack_idx];
+    pack_128b_t s_out_pack = reinterpret_cast<const pack_128b_t*>(suffix_head_ptr)[pack_idx];
+    pack_128b_t o_output_pack;
+
+    #pragma unroll
+    for(int i = 0;i<pack_size;++i)
+    {
+        float p_out_f = vllm::to_float(reinterpret_cast<const scalar_t*>(&p_out_pack)[i]);
+        float s_out_f = vllm::to_float(reinterpret_cast<const scalar_t*>(&s_out_pack)[i]);
+        float o_out_f = p_out_f * p_scale + s_out_f * p_scale;
+
+        vllm::from_float(reinterpret_cast<const scalar_t*>(&o_output_pack)[i],o_out_f);
+    }
+    reinterpret_cast<pack_128b_t*>(output_head_ptr)[pack_idx] = o_output_pack;
+}
+```
+
+## NCU Profile分析
+最后可以使用 `ncu` 抓一下当 `num_tokens = 512` ,`num_heads = 16`, `head_size = 64` 时实际跑的 `SASS` 指令，可以发现：
+确实都用上了向量化访存指令，每次取值都是 `128bit` ，虽然 `warp stall` 相较于 `triton kernel`有所下降，但是仍然有**91次**因`Long Scoreboard`而导致的 `warp stall`，后续可以采用 `double buffer` 等方法进行优化。
+
+![CUDA kernel NCU profile](image/cuda_sass.png)
+
+而 `triton kernel`通过 `ncu` 抓取出来的 `SASS` 如图所示：
+![triton kernel NCU profile](image/triton_sass.png)
+
+对比一下`memory throughput`:17.35(Triton kernel)->27.14(CUDA kernel)，在使用`bfloat16`进行推理的情况下能够达到`~1.69x`的加速比
+![compare_summary](image/compare_summary.png)
