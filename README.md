@@ -392,3 +392,187 @@ if(pack_offest<head_size)
 
 对比一下`memory throughput`:17.35(Triton kernel)->27.14(CUDA kernel)，在使用`bfloat16`进行推理的情况下能够达到`~1.69x`的加速比
 ![compare_summary](image/compare_summary.png)
+
+## diapatch 逻辑
+这里的 `merge_attn_states` 是 `C++` 层面对接 `Python` 的入口函数。当 `Python` 端调用该算子时，`DISPATCH_BY_SCALAR_DTYPE` 宏会根据输入张量 `output` 的动态数据类型（dtype）进行路由分发。
+
+它通过宏替换，将匹配到的 `C++` 静态数据类型（如 `float` 或 `uint16_`t）作为模板参数传递给 `CALL_MERGE_ATTN_STATES_LAUNC`HER 宏。最终，调用链路进入 `merge_attn_states_launcher` 启动器层，在这里提取出张量底层的显存指针（.data_ptr()），并配置好 `Grid` 和 `Block`，启动对应数据类型编译生成的 `CUDA` 核函数。
+
+```C++
+#define DISPATCH_BY_DTYPE(scalar_dtype,fn)                              \
+{                                                                       \
+    if(scalar_dtype == at::ScalarType::Float){                          \
+        fn(float);                                                      \
+    }else if(scalar_dtype == at::ScalarType::Half){                     \
+        fn(uint16_t);                                                   \
+    }else if(scalar_dtype == at::ScalarType::BFloat16){                 \
+        fn(__nv_bfloat16);                                              \
+    }else{                                                              \
+        TORCH_CHECK(false,"Unsupported data type of O: ", scalar_dtype); \
+    }                                                                   \
+}
+
+#define LAUNCH_MERGE_ATTN_STATES(scalar_t,NUM_THREADS)                  \
+{                                                                       \
+    vllm::merge_attn_state_kernel<scalar_t,NUM_THREADS><<<grid,block>>>(\
+        reinterpret_cast<scalar_t*>(output.data_ptr()),                 \
+        reinterpret_cast<scalar_t*>(prefix_output.data_ptr()),          \
+        reinterpret_cast<float*>(prefix_lse.data_ptr()),             \
+        reinterpret_cast<scalar_t*>(suffix_output.data_ptr()),          \
+        reinterpret_cast<float*>(suffix_lse.data_ptr()),             \
+        output_lse_ptr,num_tokens,num_heads,head_size                       \
+    );                                                                  \
+}
+
+
+template<typename scalar_t>
+void merge_attn_state_launcher(torch::Tensor& output,
+                                torch::Tensor& prefix_output,
+                                torch::Tensor& prefix_lse,
+                                torch::Tensor& suffix_output,
+                                torch::Tensor& suffix_lse,
+                                std::optional<torch::Tensor> output_lse)
+{
+    constexpr uint NUM_THREADS = 128;
+    const uint num_tokens = output.size(0);
+    const uint num_heads = output.size(1);
+    const uint head_size = output.size(2);
+    const uint pack_size = 16/sizeof(scalar_t);
+    TORCH_CHECK(head_size%pack_size==0,"headsize must be multiple of pack_size:",pack_size);
+    float* output_lse_ptr = nullptr;
+    if(output_lse.has_value())
+    {
+        output_lse_ptr = output_lse.value().data_ptr<float>();
+    }
+    const uint threads_per_head = head_size/pack_size;
+    const uint total_threads = num_tokens*num_heads*threads_per_head;
+
+    dim3 block(NUM_THREADS);
+    dim3 grid((total_threads+NUM_THREADS-1)/NUM_THREADS);
+
+    LAUNCH_MERGE_ATTN_STATES(scalar_t, NUM_THREADS);
+}
+
+#define CALL_MERGE_ATTN_STATES_LAUNCHER(scalar_t)                       \
+{                                                                       \
+    merge_attn_state_launcher<scalar_t>(output,prefix_output,prefix_lse,\
+                                        suffix_output,suffix_lse,       \
+                                        output_lse);                    \
+}
+
+void merge_attn_states(torch::Tensor& output,
+                        torch::Tensor& prefix_output,
+                        torch::Tensor& prefix_lse,
+                        torch::Tensor& suffix_output,
+                        torch::Tensor& suffix_lse,
+                        std::optional<torch::Tensor> output_lse
+)
+{
+    DISPATCH_BY_DTYPE(output.dtype(), CALL_MERGE_ATTN_STATES_LAUNCHER);
+}
+```
+
+## Pytorch binding
+为了能在 `PyTorch` 中使用，需要把 `kernel` 进行 `binding` ,在vllm/crsc/ops.h头文件中添加函数的声明，
+
+```C++
+void merge_attn_states(torch::Tensor& output,
+                        torch::Tensor& prefix_output,
+                        torch::Tensor& prefix_lse,
+                        torch::Tensor& suffix_output,
+                        torch::Tensor& suffix_lse,
+                        std::optional<torch::Tensor> output_lse
+);
+```
+
+然后在 `torch_binding.cpp` 中，注册 `C++` 的内存符号，挂载在Pytorch运行时的 `torch.ops` 字典树上，生成底层入口 `torch.ops._C.merge_attn_states`，最后在 `_custom_ops.py` 中包装为python函数
+
+```C++
+  ops.def(
+    "merge_attn_states("
+    "   Tensor! output,"
+    "   Tensor! prefix_output,"
+    "   Tensor! prefix_lse,"
+    "   Tensor! suffix_output,"
+    "   Tensor! suffix_lse,"
+    "   Tensor!? output_lse) -> ()");
+  ops.impl("merge_attn_states",torch::kCUDA,&merge_attn_states);
+```
+
+## Fallback逻辑
+由于这个的算子实现只支持3种数据类型；并且，由于强行使用了向量化，导致对 `headsize` 有要求，必须要 `pack_size` 的整数倍。那么对于不支持的情况，可以使用 `fallback` 到 `Triton kernel` 来跑。
+
+```python
+import torch
+
+from vllm.platforms import current_platform
+
+def merge_attn_states(
+    output: torch.Tensor,                       # 最终合并后写回的全局Attention输出矩阵O
+    prefix_output: torch.Tensor,                # 前缀局部输出
+    prefix_lse: torch.Tensor,                   # 前缀注意力尺度LSE
+    suffix_output: torch.Tensor,                #后缀局部输出
+    suffix_lse: torch.Tensor,                   #后缀注意力尺度LSE
+    output_lse: torch.Tensor | None = None,     # 合并后的全局注意力尺度LSE
+) -> None:
+    
+    def supported_dtype(o:torch.Tensor) -> bool:
+        return o.dtype in [torch.float32,torch.bfloat16,torch.float16]
+    
+    def supported_headdim(o:torch.Tensor) -> bool:
+        headdim = o.shape[2]    #   [num_tokens,num_heads,headsize]
+        if o.dtype == torch.float32:
+            return headdim%4==0
+        return headdim%8==0
+    
+    if(current_platform.is_cuda() and supported_dtype(output) and supported_headdim(output)):
+        from vllm._custom_ops import merge_attn_states
+        merge_attn_states(output,prefix_output,prefix_lse,suffix_output,suffix_lse,output_lse)
+
+    else:
+        from vllm.v1.attention.ops import triton_merge_attn_states as merge_attn_states
+        merge_attn_states(output,prefix_output,prefix_lse,suffix_output,suffix_lse,output_lse)
+
+```
+
+## 单元测试
+以下是一次单元测试的结果：
+```
+NUM TOKEN:2048, NUM HEAD:32, HEAD SIZE:32, DEVICE:cuda
+
+----------------------------------------------------------------------------------------------------
+torch kernel avg time:0.225883
+triton kernel avg time:0.057666
+cuda kernel avg time:0.017016
+the performance improve compare with triton kernel is:3.39
+----------------------------------------------------------------------------------------------------
+output all match, max abs diff:
+(Triton vs Torch):5.960464477539062e-07
+(CUDA vs Torch):4.76837158203125e-07
+(CUDA vs Triton):4.76837158203125e-07
+----------------------------------------------------------------------------------------------------
+output_lse all match, max abs diff:
+(Triton vs torch): 2.384185791015625e-07
+(CUDA vs torch): 0.0
+(CUDA vs Triton): 2.384185791015625e-07
+----------------------------------------------------------------------------------------------------
+```
+
+## 性能评估
+最后利用 `pytest` 完成了`BATCH_NUM_TOKENS = [256,512,613,1024,1536,2048,4096]` `NUM_QUERY_HEADS = [16,32,48,64,128]` `HEAD_SIZES = [32,48,64,96,128,256]` `DTYPES = [torch.float32,torch.half,torch.bfloat16]`的综合测试，并生成了一个包含性能评估的 `markdown` 表格。使用 `CUDA kernel` 而非 `Triton` ，可以最大程度较小CPU开销并提高kernel性能。与 `Triton kernel` 相比，实现的 `CUDA kernel` **最高可实现4倍的算子加速**。部分结果如下所示，完整的性能表格见[performance](performance.md)
+![part of performance](image/part_of_performance.png)
+
+
+## 端到端测试
+最后用 `evalscope` 来跑了端到端的精度回归，采用 `mmlu` 数据库
+```shell
+evalscope eval                                      \
+--model /workspace/llama/                           \
+--api-url http://0.0.0.0:8862/v1/chat/completions   \
+--api-key EMPTY                                     \
+--eval-batch-size 32                                \
+--eval-type openai_api                              \
+--datasets mmlu                                     \
+```
+
+最后结果如[E2E_result](E2E.md)所示
