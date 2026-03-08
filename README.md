@@ -560,6 +560,7 @@ output_lse all match, max abs diff:
 
 ## 性能评估
 最后利用 `pytest` 完成了`BATCH_NUM_TOKENS = [256,512,613,1024,1536,2048,4096]` `NUM_QUERY_HEADS = [16,32,48,64,128]` `HEAD_SIZES = [32,48,64,96,128,256]` `DTYPES = [torch.float32,torch.half,torch.bfloat16]`的综合测试，并生成了一个包含性能评估的 `markdown` 表格。使用 `CUDA kernel` 而非 `Triton` ，可以最大程度较小CPU开销并提高kernel性能。与 `Triton kernel` 相比，实现的 `CUDA kernel` **最高可实现4倍的算子加速**。部分结果如下所示，完整的性能表格见[performance](performance.md)
+
 ![part of performance](image/part_of_performance.png)
 
 
