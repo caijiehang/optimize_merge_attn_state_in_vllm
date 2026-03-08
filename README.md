@@ -29,7 +29,7 @@ $$\mathbf{O}(\mathcal{T}) = \sum_{j \in \mathcal{T}} \frac{\exp(\mathbf{q} \cdot
 论文里将注意力状态定义注意力输出和注意力尺度的元组：
 $
 \begin{bmatrix}
-O(\mathcal{J}) \\ 
+O(\mathcal{J}) \\
 \text{LSE}(\mathcal{J})
 \end{bmatrix}
 $
