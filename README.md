@@ -27,12 +27,7 @@ $$\mathbf{O}(\mathcal{J}) = \sum_{i \in \mathcal{J}} \frac{\exp(\mathbf{q} \cdot
 $$\mathbf{O}(\mathcal{T}) = \sum_{j \in \mathcal{T}} \frac{\exp(\mathbf{q} \cdot \mathbf{k}_j)}{\exp(\mathbf{LSE}(\mathcal{T}))} \cdot \mathbf{v}_i$$
 
 论文里将注意力状态定义注意力输出和注意力尺度的元组：
-$
-\begin{bmatrix}
-O(\mathcal{J}) \\
-\text{LSE}(\mathcal{J})
-\end{bmatrix}
-$
+$\begin{bmatrix} O(\mathcal{J}) \\ \text{LSE}(\mathcal{J}) \end{bmatrix}$
 那么对于 $\mathcal{T} \cup \mathcal{J}$ 的注意力状态就可以通过引入算子 $\oplus$ 进行计算：
 
 $$
